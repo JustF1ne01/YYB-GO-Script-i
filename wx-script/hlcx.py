@@ -16,7 +16,7 @@ cron: 35 9 * * *
 
 功能仅包含：静默登录、每日签到、签到前后奖励金对比、钱包余额查询与通知。
 """
-作者：lcmovie https://github.com/lcmovie
+# 作者：lcmovie https://github.com/lcmovie
 
 from __future__ import annotations
 
