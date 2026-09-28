@@ -4,11 +4,12 @@
 # cron: 31 7,12,23 * * *
 """
 name: WorkBuddy 签到
-cron: 31 7,12,23 * * *
+cron: 31 7,12 * * *
 
 ════════════════════════════════════════════════════════════════
-该脚本引用自：https://github.com/L0NE-6/WorkBuddy-Daily
-修改后主要适配：YYB-GO-Script，实现无感取码，自动打卡 + 全部成长任务！
+该脚本引用自原作者：https://github.com/L0NE-6/WorkBuddy-Daily
+修改作者：lcmovie https://github.com/lcmovie/YYB-GO-Script-i
+修改后主要适配：https://github.com/525815266/YYB-Go-Enhanced，实现无感取码，自动打卡 + 全部成长任务！
 ════════════════════════════════════════════════════════════════
 🌱 WorkBuddy Daily - 全能签到脚本 v2.5（YYB 无感取码版）
 ════════════════════════════════════════════════════════════════
@@ -80,7 +81,6 @@ cron: 31 7,12,23 * * *
 🔒 隐私说明
    脚本不含任何账号、手机号、Token 或设备信息，所有凭据均由环境变量注入。
 
-作者：lcmovie https://github.com/lcmovie
 """
 
 import argparse
