@@ -72,6 +72,7 @@ ql repo "https://github.com/lcmovie/YYB-GO-Script-i.git" "^(wx-script|idp-script
 | 顺丰中秋博饼集礼盒 | `sfsyzq.py` |
 | WorkBuddy签到 | `WorkBuddy_yyb.py` |
 
+| 勇闯天涯签到 | `ycty.py` |
 使用前请先部署 YYB-Go-Enhanced，并按各脚本文件头部说明配置 `YYB_SERVER` 等环境变量。
 
 ## 独立脚本
