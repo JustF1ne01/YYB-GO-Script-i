@@ -12,16 +12,6 @@ cron: 44 7 * * *
 青龙环境变量：
   YYB_SERVER           必填，YYB-Go-Enhanced地址@微信账号标识，多账号每行一条
                        例：yyb-go:8000@1
-  YYB_API_KEY          可选，对应 YYB_PROTOCOL_TOKEN，设置后带 Authorization 头
-  YCTY_DRY_RUN         可选，=1 只查询不签到（建议首次这样试）
-  YCTY_ENABLE_SIGN     可选，默认 1；=0 只查询不签到
-  YCTY_ENABLE_TASK     可选，默认 1；=0 关闭「自动完成新手/每月任务」
-  YCTY_AUTO_TASKS      可选，逗号分隔的自动任务 taskType 白名单，默认
-                       SHARE_APP,ACCESS_JD,ACCESS_BEERTOWN
-  YCTY_LOGIN_RETRY     可选，登录重试次数，默认 3（code 一次性，失败会换新 code 重试）
-  YCTY_REQUEST_TIMEOUT 可选，单次请求超时秒数，默认 30
-  YCTY_RANDOM_HEADERS  可选，默认 1；=0 关闭随机 User-Agent
-  YCTY_DEBUG           可选，=1 打印请求/响应明细，便于排查接口变动
 
 依赖：requests
 通知：优先使用青龙内置 notify.py；未配置时回落到 PushPlus / Server酱 / 企业微信 / Bark。
@@ -29,68 +19,7 @@ cron: 44 7 * * *
 功能：查询签到状态与任务清单 -> 每日签到 -> 自动完成可自动的新手/每月任务 -> 复查积分
       -> 汇总通知。多账号串行。
 
-────────────────────────────────────────────────────────────────────────────
-登录链路与接口（全部由小程序包静态分析 + 青龙容器实测复现，无任何抓包）
-────────────────────────────────────────────────────────────────────────────
-小程序 AppID  wx13c6d1dffe3b32ec      接口域  https://superX.crb.cn
-所有接口统一 base 为 https://superX.crb.cn/Api/<path>，鉴权只靠 URL query 的
-sessionKey 参数（无签名、无额外请求头），content-type 固定 application/json。
-
-  1. YYB     POST /wxapp/getCode                      -> wx.login code + openid
-  2. 勇闯天涯 POST /Api/b3/OAuthProgram/Login  body {"code": <code>}
-             -> data.sessionKey / openId / unionId / newUser
-  3. 后续请求 GET/POST 均带 ?sessionKey=<sk>（POST 时 body 不再含 SessionKey）
-     登录失效码 code=2000，成功码 code=0
-
-────────────────────────────────────────────────────────────────────────────
-业务接口
-────────────────────────────────────────────────────────────────────────────
-  GET  /Api/b1/GetUserInfo   -> data{name, headImg, phone, score(积分), xmedal(X勋章),
-                                 totalXNum(X值), cardNum, couponNum, ...}
-  POST /Api/sign/getSignInfo -> data{signed, signDayNum(连签), score, subscribed,
-                                 signDaysV1(连签阶梯奖励), nowDate, allDays(本月逐日),
-                                 taskInfoList(新手/每月任务清单), unSignDays(漏签天数)}
-  POST /Api/sign/addSign     body {}  -> 执行每日签到（+10 积分，连签天数 +1）
-  POST /Api/sign/doTask      body {"taskType": <taskType>} -> 完成任务（+10 积分）
-  POST /Api/sign/addAfterSign body {"signDate": "YYYY-MM-DD"} -> 补签（消耗 X 勋章）
-  GET  /Api/b1/GetSignHistory -> 签到历史（本脚本不依赖，仅备查）
-
-────────────────────────────────────────────────────────────────────────────
-任务体系（sign/getSignInfo 的 taskInfoList，前端页面标题为「新手任务」，
-顶部文案「完成每月任务领取X勋章大礼包」）
-────────────────────────────────────────────────────────────────────────────
-  每个任务 {name, taskType, score, isDone, isTip}，完成 +10 积分。实测（2026-09-28）：
-
-     ✅ 可自动（服务端不校验真实行为，直接 doTask 即完成，+10 分）：
-        SHARE_APP       首次分享签到活动
-        ACCESS_JD       首次访问京东旗舰店
-        ACCESS_BEERTOWN 首次探索 SNOWVERSE
-     ⚠️ 需真人（doTask 返回 code=1「未完成」，脚本只读不伪造）：
-        UPDATE_USERINFO 首次完善个人信息（需跳转填写资料）
-        SCAN_QR_CODE    首次扫描瓶盖码（需真机扫码）
-        SUB_MSG         首次订阅服务消息（需授权订阅）
-        BUG_GIFT        首次参与 XBOX 兑换（需兑换实物/礼品）
-
-  连签阶梯奖励（signDaysV1，服务端在签到时自动发放，无需领取接口）：
-        连签 3 天 +6 枚 X 勋章 / 7 天 +16 / 14 天 +66 / 30 天 +166
-
-────────────────────────────────────────────────────────────────────────────
-能力边界（如实说明）
-────────────────────────────────────────────────────────────────────────────
-  · 补签 sign/addAfterSign 需消耗 X 勋章（每漏签 1 天 20 枚），且会吃掉连签奖励攒下的
-    勋章，性价比为负；脚本默认不做补签。
-  · 4 个「需真人」任务（完善资料/扫码/订阅/XBOX 兑换）绑定真实行为凭证，无法在青龙
-    代跑，脚本只在通知里列出「还差哪几项、值不值得手动点」，不伪造任何行为上报。
-  · 积分（score）与 X 勋章（xmedal）是两套：score 用于兑换，xmedal 是连签奖励。
-    对账以 score 为准，同时展示 xmedal 变化。
-
-实测记录（2026-09-28，青龙容器 ql2）
-────────────────────────────────────────────────────────────────────────────
-  · 账号「小李小李 不用送礼🎁」：签到 +10、自动完成 SHARE_APP/ACCESS_JD/ACCESS_BEERTOWN
-    各 +10，score 0 → 40；UPDATE_USERINFO/SUB_MSG 返回 code=1 未完成（符合预期）。
-  · 未绑定手机号（phone=""）不影响签到与任务，无需跳过。
-
-作者：lcmovie https://github.com/lcmovie
+# 作者：lcmovie https://github.com/lcmovie
 """
 from __future__ import annotations
 
