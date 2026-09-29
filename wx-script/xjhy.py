@@ -1,10 +1,10 @@
-#  修改脚本 563行的配置信息
-#  脚本同文件夹放青龙面板自带的notify.py推送脚本
 """
-习酒花园（微信协议版）- 统一合并版本
+习酒花园 / 君品荟（YYB-Go-Enhanced）
 
-入口: 微信小程序 习酒 (wx489f950decfeb93e)
-后端: apimallwm.exijiu.com / xcx.exijiu.com
+入口: 微信小程序 君品荟 (wx8d41cdc44c8aeaab)
+后端: fm.exijiu.com / apimallwm.exijiu.com
+2026-09: 主登录 token + AppID 请求头 + 花园 session key 同步。
+账号须先在君品荟小程序中完成手机号授权登录。
 功能: 自动签到、种高粱、酿酒、答题、抽奖、制曲
 
 环境变量配置说明：
@@ -30,6 +30,8 @@
   GARDEN_AUTO_WINE  自动酿酒开关
                   0 = 关闭酿酒（不投粮、不制酒、不处理酒坛）
                   1 = 开启酿酒（默认）
+  GARDEN_APPID    默认 wx8d41cdc44c8aeaab；旧习酒可指定 wx489f950decfeb93e
+  GARDEN_NOTIFY   0 = 关闭通知，1 = 开启（默认）
 
 cron: 31 8,16 * * *
 """
@@ -67,7 +69,12 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 def send_notify(title, content):
+    if os.getenv("GARDEN_NOTIFY", "1").lower() in ("0", "false", "no"):
+        return
     try:
+        for directory in (Path(__file__).resolve().parent, Path('/ql/data/scripts'), Path('/ql/scripts')):
+            if (directory / 'notify.py').is_file() and str(directory) not in sys.path:
+                sys.path.insert(0, str(directory))
         from notify import send as _notify_send
         _notify_send(title, content)
     except ImportError:
@@ -113,7 +120,9 @@ WINE_STATUS = {0: "空坛", 1: "空坛", 2: "已酿好", 3: "酿造中", 4: "已
 
 BASE_URL = "https://apimallwm.exijiu.com"
 MAIN_BASE_URL = "https://xcx.exijiu.com/anti-channeling/public/index.php/api/v2"
-APPID = "wx489f950decfeb93e"
+APPID = os.getenv('GARDEN_APPID', 'wx8d41cdc44c8aeaab').strip()
+CURRENT_APPID = 'wx8d41cdc44c8aeaab'
+CURRENT_MAIN_URL = 'https://fm.exijiu.com/api/v2'
 DEFAULT_WECHAT_SERVER = "http://127.0.0.1:8011"
 
 # 环境变量
@@ -163,6 +172,9 @@ class TokenInvalidError(BaseException):
     """Token or encryption key invalid, needs re-login"""
     pass
 
+class AccountAuthorizationError(RuntimeError):
+    """需要账号持有人在小程序完成手机号授权，重试 code 无法解决。"""
+
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
@@ -196,11 +208,12 @@ class WxAdapter:
 
     def __init__(self, server_url=None):
         self.server_url = (server_url or DEFAULT_WECHAT_SERVER).rstrip("/")
-        yyb_entry = (
+        yyb_lines = (
             os.environ.get("YYB_SERVER") or
             os.environ.get("YINGYOGBAO_SERVER") or
             ""
-        ).splitlines()[0].strip()
+        ).splitlines()
+        yyb_entry = yyb_lines[0].strip() if yyb_lines else ""
         yyb_url = yyb_entry.rsplit("@", 1)[0] if "@" in yyb_entry else yyb_entry
         if yyb_url and not yyb_url.startswith(("http://", "https://")):
             yyb_url = "http://" + yyb_url
@@ -211,6 +224,10 @@ class WxAdapter:
 
     def get_wx_code(self, wxid, appid):
         """获取微信code - 优先使用 getCode.py，回退到牛子API"""
+        if self._yyb_entry_for(wxid):
+            result = self._yyb_call('getCode', wxid, appid)
+            code = result.get('code')
+            return {'success': bool(code), 'code': code, 'error': 'YYB未返回有效code'}
         if _HAS_GETCODE:
             try:
                 code = get_single_code(appid, wxid)
@@ -251,7 +268,7 @@ class WxAdapter:
             if not value or "@" not in value:
                 continue
             server, ref = value.rsplit("@", 1)
-            server, ref = server.strip().rstrip("/"), ref.strip()
+            server, ref = server.strip().rstrip("/"), self._raw_id(ref)
             if not server or not ref:
                 continue
             if not server.startswith(("http://", "https://")):
@@ -262,11 +279,19 @@ class WxAdapter:
     def _yyb_entry_for(self, wxid):
         entries = self._configured_yyb_entries()
         raw_id = self._raw_id(wxid)
-        for entry in entries:
-            if raw_id in (entry["ref"], f'{entry["server"]}@{entry["ref"]}'):
-                return entry
-        if len(entries) == 1:
-            return entries[0]
+        if "@" in raw_id:
+            server, ref = raw_id.rsplit("@", 1)
+            if not server.startswith(("http://", "https://")):
+                server = "http://" + server
+            for entry in entries:
+                if server.rstrip("/") == entry['server'] and ref == entry['ref']:
+                    return entry
+            return None
+        matched = [entry for entry in entries if raw_id == entry['ref']]
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            raise RuntimeError("多个 YYB 服务存在同名账号，请用 地址@ref 指定账号")
         return None
 
     def _is_wxid_style(self, wxid):
@@ -305,17 +330,12 @@ class WxAdapter:
                 if str(acc.get("id", "")) == raw_id:
                     return raw_id
 
-        for acc in accounts:
-            openid = acc.get("openid", "") or ""
-            if openid and (raw_id in openid or openid in raw_id):
-                return str(acc.get("id", "") or raw_id)
-
-        if len(accounts) == 1:
-            return str(accounts[0].get("id", "") or raw_id)
         return raw_id
 
     def _yyb_call(self, endpoint, wxid, appid, payload=None):
         entry = self._yyb_entry_for(wxid)
+        if not entry and len({item['server'] for item in self._configured_yyb_entries()}) > 1:
+            raise RuntimeError('无法确定账号对应的 YYB 服务，请用 地址@ref')
         yyb_server = entry["server"] if entry else self.yyb_server
         if not yyb_server:
             raise RuntimeError("未配置 YYB_SERVER")
@@ -332,7 +352,7 @@ class WxAdapter:
         result = resp.json()
         if not isinstance(result, dict):
             raise RuntimeError(f"YYB响应异常: {resp.text[:120]}")
-        if "code" in result and result.get("code") not in (0, "0", None):
+        if result.get("code") not in (0, "0"):
             msg = result.get("error") or result.get("msg", resp.text[:120])
             raise RuntimeError(msg)
         inner = result.get("result")
@@ -373,16 +393,18 @@ class WxAdapter:
             pass
         return value
 
-    def _extract_encrypt_key(self, data):
+    def _extract_encrypt_key(self, data, _depth=0):
+        if _depth > 12:
+            return None
         data = self._decode_jsonish(data)
         if not isinstance(data, dict):
             return None
 
         code = data.get("Code")
-        if code not in (None, 0) and data.get("Success") is not True:
+        if code not in (None, 0, '0') and data.get("Success") is not True:
             return None
 
-        inner = data.get("Data") or data.get("data") or data.get("result") or data.get("rawData") or {}
+        inner = data.get("Data") or data.get("data") or data.get("result") or data.get("rawData")
         if isinstance(inner, dict):
             jsapi_err = inner.get("jsapiBaseresponse", {}).get("errcode")
             if jsapi_err is not None and jsapi_err != 0:
@@ -398,10 +420,11 @@ class WxAdapter:
                 "expire_in": data.get("expire_in") or data.get("expireIn"),
             }
 
-        if isinstance(inner, dict) or isinstance(inner, str):
-            parsed = self._extract_encrypt_key(inner)
-            if parsed:
-                return parsed
+        for field in ('Data', 'data', 'result', 'rawData'):
+            if field in data:
+                parsed = self._extract_encrypt_key(data[field], _depth + 1)
+                if parsed:
+                    return parsed
         return None
 
     def _extract_encrypted_data(self, data):
@@ -435,7 +458,7 @@ class WxAdapter:
                 if parsed:
                     log.info(f"YYB 获取加密密钥成功 version={parsed.get('version')}")
                     return {"success": True, **parsed}
-                log.warning(f"YYB get_user_encrypt_key无法提取密钥: {data}")
+                log.warning("YYB 未返回有效用户加密密钥")
             except Exception as e:
                 log.warning(f"YYB get_user_encrypt_key失败，尝试牛子API: {e}")
 
@@ -445,7 +468,7 @@ class WxAdapter:
         if parsed:
             log.info(f"牛子 获取加密密钥成功 version={parsed.get('version')}")
             return {"success": True, **parsed}
-        return {"success": False, "error": f"无法提取加密密钥: {str(data)[:200]}"}
+        return {"success": False, "error": "无法提取有效用户加密密钥"}
 
     def call_function(self, wxid, appid, data_str):
         """调用小程序云函数，兼容牛子与YYB"""
@@ -467,7 +490,7 @@ class WxAdapter:
         data = self._post("app/call/function", body)
         outer_ok = data.get("Code") == 0 or data.get("Success") is True
         if not outer_ok:
-            return {"success": False, "error": data.get("Message", str(data))}
+            return {"success": False, "error": data.get("Message", "微信接口调用失败")}
         inner = data.get("Data") or data.get("data") or {}
         jsapi_err = inner.get("jsapiBaseresponse", {}).get("errcode")
         if jsapi_err is not None and jsapi_err != 0:
@@ -528,7 +551,7 @@ class WxAdapter:
                 inner.get("Sessionid") or inner
             )
             return {"success": True, "session_key": session_key, "raw": inner}
-        return {"success": False, "error": data.get("Message", str(data))}
+        return {"success": False, "error": data.get("Message", "未返回有效用户加密密钥")}
 
     # 内部方法
     def _post(self, path, body):
@@ -562,13 +585,22 @@ class GardenClient:
         self._crypto_iv = ""
         self._wx = None
         self._wx_appid = APPID
+        self._wine_session = None
         self.ocr = DdddOcr(ocr_server) if ocr_server else None
+        if APPID == CURRENT_APPID:
+            self.session.headers.update({
+                'AppID': APPID,
+                'App-Version': '1.7',
+                'Authorization': 'Basic ' + base64.b64encode(b'wechat:wechat_secret').decode(),
+            })
         if token:
-            self.session.headers["Authorization"] = token
+            self.set_token(token)
 
     def set_token(self, token):
         self.token = token
-        self.session.headers["Authorization"] = token
+        self._wine_session = None
+        header = 'X-Access-Token' if APPID == CURRENT_APPID else 'Authorization'
+        self.session.headers[header] = token
 
     def set_crypto(self, key, iv, version=3):
         key_bytes = key.encode("utf-8")
@@ -587,6 +619,9 @@ class GardenClient:
         self.wxid = wxid
         self._wx = wx
         self._wx_appid = appid
+        self.crypto = None
+        if appid == CURRENT_APPID:
+            return self._auto_login_current()
 
         # Step 1: 获取 login_code（主系统）
         code_res1 = wx.get_wx_code(wxid, appid)
@@ -609,7 +644,7 @@ class GardenClient:
         login_result = self.login(code_res2["code"])
         token = login_result.get("authorized_token") or login_result.get("token") or login_result.get("access_token")
         if not token:
-            raise RuntimeError(f"登录未返回token，响应: {login_result}")
+            raise RuntimeError("登录未返回有效 token")
         self.set_token(token)
 
         # Step 3: 获取加密密钥
@@ -646,6 +681,32 @@ class GardenClient:
             self._try_get_auth(encrypted_data, iv)
 
         return {"token": token, "crypto_ready": self.crypto is not None}
+
+    def _auto_login_current(self):
+        code_result = self._wx.get_wx_code(self.wxid, self._wx_appid)
+        if not code_result.get('success'):
+            raise RuntimeError('YYB未返回有效登录 code')
+        response = self.session.post(CURRENT_MAIN_URL + '/login/wxMiniSilentLogin',
+                                     json={'code': code_result['code']}, timeout=20)
+        response.raise_for_status()
+        data = self._handle_response(response.json(), None)
+        token = data.get('token') if isinstance(data, dict) else None
+        if not token:
+            raise AccountAuthorizationError('请先在君品荟小程序完成手机号授权登录（静默登录未返回 token）')
+        self.set_token(token)
+        self.prepare_current_crypto()
+        return {'token': token, 'crypto_ready': True}
+
+    def prepare_current_crypto(self):
+        """wx.login 会改变会话；先保存新 session key，再取同一小程序的用户密钥。"""
+        code_result = self._wx.get_wx_code(self.wxid, self._wx_appid)
+        if not code_result.get('success'):
+            raise RuntimeError('YYB未返回有效花园会话 code')
+        self._get('/garden/wechat/saveSessionKey', {'code': code_result['code']})
+        result = self._wx.get_user_encrypt_key(self.wxid, self._wx_appid)
+        if not result.get('success'):
+            raise RuntimeError('未取得君品荟用户加密密钥')
+        self.set_crypto(result['encrypt_key'], result['iv'], result.get('version', 3))
 
     def _try_encrypted_data_via_userinfo(self, wx, wxid, appid):
         try:
@@ -684,6 +745,9 @@ class GardenClient:
         elapsed = time.time() - self._crypto_set_time
         if elapsed < 3300:
             return
+        if self._wx_appid == CURRENT_APPID:
+            self.prepare_current_crypto()
+            return
         try:
             res = self._wx.get_user_encrypt_key(self.wxid, self._wx_appid)
             if res.get("success"):
@@ -693,7 +757,7 @@ class GardenClient:
 
     def _encrypt_payload(self, data):
         if not self.crypto:
-            return data or {}
+            raise RuntimeError('加密未就绪，无法提交花园操作')
         self._refresh_crypto_if_needed()
         result = dict(data) if data else {}
         result["ts"] = int(time.time() * 1000)
@@ -702,18 +766,26 @@ class GardenClient:
         return result
 
     def _handle_response(self, body, retry_fn):
-        code = body.get("code") or body.get("err")
+        if not isinstance(body, dict):
+            raise RuntimeError("业务接口响应不是 JSON 对象")
+        code = body.get("code") if body.get("code") is not None else body.get("err")
+        try:
+            code = int(code)
+        except (ValueError, TypeError):
+            pass
         msg = body.get("msg") or ""
-        if code == 0:
+        if code in (0, 10000):
             return body.get("data")
         if code == 5001 or "加密校验失败" in msg or "用户信息异常" in msg:
             raise TokenInvalidError(f"[5001] {msg} (加密校验失败)")
-        if code == 4012 or "非法的用户 token" in msg:
+        if code in (401, 4012) or "非法的用户 token" in msg:
             raise TokenInvalidError(f"[4012] {msg} (非法的用户 token)")
         if code == 5008:
             if self.ocr is None:
                 raise RuntimeError("触发滑块验证(5008)，请设置 OCR_SERVER")
             self._solve_slide_validate()
+            if retry_fn is None:
+                raise RuntimeError('登录接口需要人工验证')
             return retry_fn()
         raise RuntimeError(f"[{code}] {msg}")
 
@@ -786,8 +858,28 @@ class GardenClient:
     # ---- 酿酒 ----
     def wine_list(self, params=None):
         return self._get("/garden/Gardenmemberwine/index", params)
+    def _wine_request(self, method, path, params=None):
+        """酿酒 H5 使用 getJwt 的 JWT，与君品荟主 token 独立。"""
+        if self._wine_session is None:
+            response = self.session.get(MAIN_BASE_URL + '/Member/getJwt', timeout=15)
+            response.raise_for_status()
+            data = self._handle_response(response.json(), None)
+            jwt = data.get('jwt') if isinstance(data, dict) else None
+            if not jwt:
+                raise RuntimeError('酿酒 H5 未返回有效 JWT')
+            self._wine_session = requests.Session()
+            self._wine_session.headers.update({'Authorization': jwt,
+                                                'User-Agent': self.session.headers['User-Agent']})
+        if method == 'GET':
+            response = self._wine_session.get(BASE_URL + path, params=params or {}, timeout=15)
+        else:
+            response = self._wine_session.post(BASE_URL + path, data=params or {}, timeout=15)
+        response.raise_for_status()
+        return self._handle_response(response.json(), None)
     def discharge_grain(self, params=None):
         volumn = (params or {}).get("volumn", 0)
+        if APPID == CURRENT_APPID:
+            return self._wine_request('POST', '/garden/gardenmemberwine/makeWine', {'volumn': volumn})
         resp = self.session.post(
             BASE_URL + "/garden/gardenmemberwine/makeWine",
             data={"volumn": volumn},
@@ -796,9 +888,13 @@ class GardenClient:
         resp.raise_for_status()
         return self._handle_response(resp.json(), lambda: self.discharge_grain(params))
     def harvest_wine(self, params=None):
+        if APPID == CURRENT_APPID:
+            return self._wine_request('GET', '/garden/Gardenmemberwine/harvestWine', params)
         return self._get("/garden/Gardenmemberwine/harvestWine", params)
     def make_yeast(self, data):
         volumn = (data or {}).get("volumn", 0)
+        if APPID == CURRENT_APPID:
+            return self._wine_request('POST', '/garden/wheat/makeWineYeast', {'volumn': volumn})
         resp = self.session.post(
             BASE_URL + "/garden/wheat/makeWineYeast",
             data={"volumn": volumn},
@@ -820,6 +916,17 @@ class GardenClient:
     def get_question_task(self):
         return self._get("/garden/Gardenquestiontask/index")
     def answer_results(self, question_id, selected):
+        if APPID == CURRENT_APPID:
+            answer = ''.join(sorted(set(str(selected).replace(',', '').replace(' ', ''))))
+            payload = self._encrypt_payload({'itemid': question_id, 'selected': answer})
+            response = self.session.get(BASE_URL + '/garden/Gardenquestiontask/answerResultsJph',
+                                        params=payload, timeout=15)
+            response.raise_for_status()
+            body = response.json()
+            # 此接口前端读取完整响应，答题结果可能直接位于 err/msg。
+            if body.get('err') not in (None, 0, '0'):
+                self._handle_response({'err': body['err'], 'msg': body.get('msg', '答题失败')}, None)
+            return self._handle_response(body, None) or {}
         answer_str = json.dumps([{"itemid": question_id, "selected": selected}], separators=(",", ":"))
         enc = self._encrypt_payload({})
         params = {"answer": answer_str}
@@ -895,12 +1002,16 @@ def parse_yyb_server_accounts(raw):
         value = line.strip()
         if not value or "@" not in value:
             continue
-        _, ref = value.rsplit("@", 1)
-        ref = ref.strip()
-        if not ref or ref in seen:
+        server, ref = value.rsplit("@", 1)
+        ref, _, note = ref.strip().partition('#')
+        server = server.strip().rstrip('/')
+        if not server.startswith(('http://', 'https://')):
+            server = 'http://' + server
+        identity = server + '@' + ref
+        if not ref or identity in seen:
             continue
-        seen.add(ref)
-        accounts.append({"id": ref, "note": ""})
+        seen.add(identity)
+        accounts.append({"id": identity, "ref": ref, "note": note})
     return accounts
 
 # ============================================================
@@ -922,6 +1033,8 @@ def _plot_remaining(ct):
 
 
 def run(client, do_daily=True):
+    client.daily_completed = not do_daily
+    client.task_warnings = []
     plot_summary_lines = []
     wine_summary_lines = []
     min_harvest_secs = None
@@ -936,6 +1049,7 @@ def run(client, do_daily=True):
         info.get("sorghum"), info.get("wheat"), info.get("wine_yeast"), info.get("wine")))
 
     if do_daily:
+        daily_ok = True
         # ── 每日签到 ──
         log.info("📅 每日签到...")
         try:
@@ -943,6 +1057,8 @@ def run(client, do_daily=True):
             log.info("   ✅ 签到成功  💧+%s  🌿+%s  %s" % (r.get("water", 0), r.get("manure", 0), r.get("tips", "")))
         except RuntimeError as e:
             log.warning("   ⚠️  签到失败: %s" % e)
+            client.task_warnings.append('签到：' + str(e))
+            daily_ok = False
         # ── 每日分享 ──
         log.info("📤 每日分享...")
         for i in range(3):
@@ -954,7 +1070,10 @@ def run(client, do_daily=True):
                 log.info("   ✅ 第%d次分享  💧+%s  🌿+%s" % (i + 1, w, m))
                 time.sleep(1)
             except RuntimeError as e:
+                daily_ok = False
+                client.task_warnings.append('分享：' + str(e))
                 log.warning("   ⚠️  分享失败: %s" % e); break
+        client.daily_completed = daily_ok
     else:
         log.info("ℹ️  签到/分享今日已完成，跳过")
 
@@ -971,6 +1090,7 @@ def run(client, do_daily=True):
         client.extend({"serial_number": ss})
         log.info("   ✅ 开垦新地块成功！")
     except RuntimeError as e:
+        client.task_warnings.append('开垦：' + str(e))
         if "4041" in str(e): log.warning("   ⚠️  开垦失败：收酒数量不足")
         else: log.warning("   ⚠️  开垦失败：%s" % e)
     except Exception as e:
@@ -980,7 +1100,7 @@ def run(client, do_daily=True):
         sorghum=int(info.get("sorghum") or 0), wheat=int(info.get("wheat") or 0),
         wine_yeast=int(info.get("wine_yeast") or 0), active_plots=len(active),
     )
-    log.info("   🌾 种植策略: %s（酒曲 %s 块，已解锁 %d 块地）" % (CROP_TYPE.get(seed_type), info.get("wine_yest"), len(active)))
+    log.info("   🌾 种植策略: %s（酒曲 %s 块，已解锁 %d 块地）" % (CROP_TYPE.get(seed_type), info.get("wine_yeast"), len(active)))
 
     water = int(info.get("water") or 0); manure = int(info.get("manure") or 0)
     for plot in plots:
@@ -996,7 +1116,6 @@ def run(client, do_daily=True):
         # 收获分支
         if (status in (10, 11) and is_ready(ct)) or (status == 2 and is_ready(ct)):
             log.info("   🌾 地块 %s（%s）[可收获] → 开始收获..." % (sn, crop))
-            plot_summary_lines.append("🌾 地块%s(%s): 已收获并重新播种" % (sn, crop))
             harvested = False
             for attempt in range(27):
                 try:
@@ -1014,6 +1133,7 @@ def run(client, do_daily=True):
                 log.info("      🌱 自动播种：%s" % CROP_TYPE.get(seed_type))
                 try:
                     client.seeds({"id": pid, "type": seed_type}); log.info("      ✅ 播种成功"); time.sleep(1)
+                    plot_summary_lines.append("🌾 地块%s(%s): 已收获并重新播种" % (sn, crop))
                     allow_water = water > 0  # 重新播种后为新苗,距成熟远,必浇
                     if allow_water and water > 0:
                         try: client.watering({"id": pid}); log.info("      💧 浇水成功"); water -= 1
@@ -1066,6 +1186,7 @@ def run(client, do_daily=True):
             plot_summary_lines.append("🟫 地块%s: 空地已播种%s" % (sn, CROP_TYPE.get(seed_type)))
             try:
                 client.seeds({"id": pid, "type": seed_type}); log.info("      ✅ 播种成功"); time.sleep(1)
+                allow_water = water > 0
                 if allow_water and water > 0:
                     try: client.watering({"id": pid}); log.info("      💧 浇水成功"); water -= 1
                     except RuntimeError as e: log.warning("      ⚠️  浇水失败：%s" % e)
@@ -1123,7 +1244,9 @@ def run(client, do_daily=True):
                 log.info("   🍶 酒坛 %s [已酿好 %sL] → 收获" % (wid, vol))
                 try:
                     r = client.harvest_wine({"id": wid}); got = r.get("wine") or r.get("volumn") or 0
-                    try: session_brewed_l += float(got)
+                    try:
+                        session_brewed_l += float(got)
+                        add_monthly_brewed(float(got))
                     except (TypeError, ValueError): pass
                     log.info("      ✅ 收获成功%s" % ("：+%sL" % got if got else ""))
                     info = client.member_info() or info; sorghum = int(info.get("sorghum") or 0)
@@ -1143,7 +1266,9 @@ def run(client, do_daily=True):
                     log.info("   🍶 酒坛 %s [酿造完成 %sL] → 收获" % (wid, vol))
                     try:
                         r = client.harvest_wine({"id": wid}); got = r.get("wine") or r.get("volumn") or 0
-                        try: session_brewed_l += float(got)
+                        try:
+                            session_brewed_l += float(got)
+                            add_monthly_brewed(float(got))
                         except (TypeError, ValueError): pass
                         log.info("      ✅ 收获成功%s" % ("：+%sL" % got if got else ""))
                         info = client.member_info() or info; sorghum = int(info.get("sorghum") or 0)
@@ -1202,7 +1327,9 @@ def run(client, do_daily=True):
         if _AUTO_EXCHANGE:
             log.info("💰 酒兑换积分：%sL → +%s 积分" % (wine_vol, wine_vol))
             try: r = client.exchange_wine(wine_vol); log.info("   ✅ 兑换成功: %s" % r)
-            except RuntimeError as e: log.warning("   ❌ 兑换失败：%s" % e)
+            except RuntimeError as e:
+                client.task_warnings.append('兑换：' + str(e))
+                log.warning("   ❌ 兑换失败：%s" % e)
             time.sleep(1)
         else: log.info("💰 酒 %sL 未兑换（自动兑换已关闭，设置 GARDEN_AUTO_EXCHANGE=1 开启）" % wine_vol)
 
@@ -1236,7 +1363,8 @@ def run(client, do_daily=True):
         fresh_plots = client.get_sorghum_list() or []; min_harvest_secs = None
         for p in fresh_plots:
             st = p.get("status", -1); ct = p.get("crop_time", "")
-            if st in (-1, 0, 10, 11): continue
+            # 新版返回 status=10 但 crop_time 仍在未来，成熟时间以服务端时间字段为准。
+            if st in (-1, 0): continue
             if ct:
                 try:
                     remaining = max(0, int((datetime.strptime(ct, "%Y-%m-%d %H:%M:%S") - datetime.now()).total_seconds()))
@@ -1267,8 +1395,11 @@ def run(client, do_daily=True):
         log.info("✅ 任务完成 │ " + summary)
         if plot_summary_lines: summary += "\n\n📋 地块状态:\n" + "\n".join(plot_summary_lines)
         if wine_summary_lines: summary += "\n\n🍶 酒坛状态:\n" + "\n".join(wine_summary_lines)
+        if client.task_warnings:
+            summary += '\n\n⚠️ 未完成项目:\n' + '\n'.join(client.task_warnings)
         # 本月酿酒累计(跨账号合并,始终展示,无论本次是否收获)
-        mkey, month_total, sess_add = add_monthly_brewed(session_brewed_l)
+        mkey, month_total, _ = add_monthly_brewed(0)
+        sess_add = session_brewed_l
         mlabel = "%d月" % datetime.now().month
         if MONTH_BASE_L > 0:
             summary += "\n\n📅 %s酿酒共计 %.2f L（起点 %.2f + 累计 %.2f）" % (
@@ -1300,12 +1431,12 @@ def update_ql_cron_time(schedule):
     #   QL_USERNAME / QL_PASSWORD        面板账号密码（老式登录兜底，二选一）
     host = (os.environ.get("QL_HOST") or "").strip()
     if host:
-        host = host.replace("http://", "").replace("https://", "").split("/")[0]
-        if ":" in host:
-            host, p = host.split(":", 1); port = int(p) if p.isdigit() else 5700
-        else:
-            port = int(os.environ.get("QL_PORT", "5700"))
+        parsed = urllib.parse.urlsplit(host if '://' in host else 'http://' + host)
+        use_https = parsed.scheme == 'https'
+        host = parsed.hostname
+        port = parsed.port or int(os.environ.get('QL_PORT', '443' if use_https else '5700'))
     else:
+        use_https = False
         port = int(os.environ.get("QL_PORT", "5700"))
     username = (os.environ.get("QL_USERNAME") or "").strip()
     password = (os.environ.get("QL_PASSWORD") or "").strip()
@@ -1317,7 +1448,8 @@ def update_ql_cron_time(schedule):
         return False
 
     def _http_json(method, path, payload="", headers=None, timeout=10):
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        connection_type = http.client.HTTPSConnection if use_https else http.client.HTTPConnection
+        conn = connection_type(host, port, timeout=timeout)
         try:
             send_headers = dict(headers or {}); send_payload = payload
             if isinstance(send_payload, str): send_payload = send_payload.encode("utf-8")
@@ -1376,13 +1508,18 @@ def update_ql_cron_time(schedule):
             rows = _extract_task_list(result)
             if rows: all_tasks = rows; break
         if not all_tasks: log.error("❌ 获取任务列表失败"); return False
-        target_task = None
+        targets = []
+        script_name = Path(__file__).name
+        script_relative = str(Path(__file__).resolve()).replace('/ql/data/scripts/', '')
         for task in all_tasks:
             if not isinstance(task, dict): continue
             name = str(task.get("name") or ""); command = str(task.get("command") or "")
-            if name == "习酒" or "习酒" in name or "习酒.py" in command or "xj.py" in command:
-                target_task = task; break
-        if not target_task: log.warning("❌ 未找到习酒任务"); return False
+            if script_relative in command or script_name in command.split():
+                targets.append(task)
+        if len(targets) != 1:
+            log.warning('无法唯一匹配当前脚本定时任务，跳过更新')
+            return False
+        target_task = targets[0]
         task_id = target_task.get("id") or target_task.get("_id")
         if task_id in (None, ""): log.error("❌ 找到任务但缺少 id"); return False
         log.info("✅ 找到习酒任务，ID = %s" % task_id)
@@ -1405,9 +1542,7 @@ def update_ql_cron_time(schedule):
 def auto_login_with_retry(client, wxid, wx_server, ocr_server=None,
                           max_retry=None, base_delay=5):
     """
-    自动重试登录：对所有错误（含 login_buffer 已过期 / 数据不存在 / 需要重新扫码等）
-    一律硬重试 max_retry 次，采用指数退避 + 随机抖动。即使明知是需重新扫码的永久错误，
-    也会按设定次数重试后再放弃。
+    网络和临时登录错误有限重试；手机号未授权或 YYB 登录过期直接报告。
     重试次数可通过环境变量 LOGIN_MAX_RETRY 设置（默认 3）。
     """
     if max_retry is None:
@@ -1430,6 +1565,8 @@ def auto_login_with_retry(client, wxid, wx_server, ocr_server=None,
             log.warning("   ⚠️  登录未返回 token（%d/%d），%ds 后重试..." % (attempt, max_retry, base_delay * attempt))
         except Exception as e:
             last_err = e
+            if isinstance(e, AccountAuthorizationError) or '[10001]' in str(e) or 'login_buffer' in str(e) or '重新扫码' in str(e):
+                raise
             log.warning("   ⚠️  登录失败（%d/%d）: %s，%ds 后重试..." % (attempt, max_retry, e, base_delay * attempt))
         if attempt < max_retry:
             time.sleep(base_delay * attempt + random.randint(0, 3))
@@ -1460,45 +1597,65 @@ if __name__ == "__main__":
         except Exception: return {}
 
     def save_cache(c):
-        try: CACHE_FILE.write_text(json.dumps(c, ensure_ascii=False, indent=2))
-        except Exception: pass
+        try:
+            temporary = CACHE_FILE.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(c, ensure_ascii=False, indent=2), encoding='utf-8')
+            temporary.chmod(0o600)
+            os.replace(temporary, CACHE_FILE)
+        except Exception as e:
+            log.warning('账号缓存保存失败：%s', type(e).__name__)
 
     def token_valid(token):
         try:
-            p = token.split(".")[1]; p += "=" * (4 - len(p) % 4)
-            return json.loads(base64.b64decode(p).decode()).get("expireTime", 0) > time.time() + 300
-        except Exception: return False
+            p = token.split(".")[1]; p += "=" * (-len(p) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(p).decode())
+            expiry = float(claims.get('exp') or claims.get('expireTime') or 0)
+            if expiry > 10**11: expiry /= 1000
+            return expiry > time.time() + 300 if expiry else APPID == CURRENT_APPID
+        except Exception: return bool(token) and APPID == CURRENT_APPID
 
     cache = load_cache()
     notify_lines = []
     all_min_harvests = []
+    completed_count = 0
 
     log.info(f"🔔 习酒花园, 开始! 共 {len(accounts)} 个账号")
 
     for i, acc in enumerate(accounts):
-        wxid = acc["id"]; remark = acc.get("note") or wxid
+        wxid = acc["id"]; remark = acc.get("note") or acc.get('ref') or wxid
         mask = (remark[:3] + "*****" + remark[-3:]) if len(remark) >= 7 else remark
         log.info("─" * 50); log.info("👤 [%d/%d] 账号: %s" % (i+1, len(accounts), mask))
 
         client = GardenClient(ocr_server=OCR_SERVER or None)
-        cached_token = cache.get(wxid, "")
+        cache_id = APPID + ':' + wxid
+        cache_ref = acc.get('ref', wxid)
+        legacy_allowed = APPID != CURRENT_APPID and sum(a.get('ref', a['id']) == cache_ref for a in accounts) == 1
+        cached_token = cache.get(cache_id, "") or (cache.get(cache_ref, "") if legacy_allowed else '')
+        if cached_token:
+            cache[cache_id] = cached_token
 
         if cached_token and token_valid(cached_token):
             log.info("   🔑 使用缓存 token"); client.set_token(cached_token)
             wx = WxAdapter(WX_SERVER)
+            client.wxid, client._wx, client._wx_appid = wxid, wx, APPID
             try:
-                enc = wx.get_user_encrypt_key(wxid, APPID)
-                if enc.get("success"):
-                    client.set_crypto(enc["encrypt_key"], enc["iv"], version=enc.get("version", 3))
-                    log.info("   🔐 加密密钥已获取  version=%s" % enc.get("version"))
-                else: cached_token = ""
-            except Exception as e: log.warning("   ⚠️  获取加密密钥异常: %s" % e); cached_token = ""
+                if APPID == CURRENT_APPID:
+                    client.member_info()
+                    client.prepare_current_crypto()
+                else:
+                    enc = wx.get_user_encrypt_key(wxid, APPID)
+                    if enc.get("success"):
+                        client.set_crypto(enc["encrypt_key"], enc["iv"], version=enc.get("version", 3))
+                    else: cached_token = ""
+            except (Exception, TokenInvalidError) as e:
+                log.warning("   ⚠️  缓存会话失效，重新登录: %s" % e)
+                cached_token = ""
 
         if not cached_token or not token_valid(cached_token):
             log.info("   🔄 token 无效或已过期，重新登录...")
             try:
                 result = auto_login_with_retry(client, wxid, WX_SERVER, OCR_SERVER, base_delay=5)
-            except Exception as e:
+            except (Exception, TokenInvalidError) as e:
                 log.error("   ❌ 登录异常: %s，跳过" % e); notify_lines.append("👤 %s\n❌ 登录失败: %s" % (mask, e)); continue
 
             log.info("   🔑 登录结果: token=%s  加密=%s" % (
@@ -1506,15 +1663,19 @@ if __name__ == "__main__":
                 "✅ 就绪" if result.get("crypto_ready") else "❌ 未就绪"))
 
             if not result.get("token"): log.error("   ❌ 登录失败，跳过"); continue
-            cache[wxid] = client.token; save_cache(cache)
+            cache[cache_id] = client.token; save_cache(cache)
 
-        if not client.crypto: log.error("   ❌ 加密未就绪，跳过"); continue
+        if not client.crypto:
+            log.error("   ❌ 加密未就绪，跳过")
+            notify_lines.append("👤 %s\n❌ 未取得有效加密密钥" % mask)
+            continue
 
         try:
-            today = datetime.now().strftime("%Y-%m-%d"); do_daily = cache.get(wxid + "_daily") != today
+            today = datetime.now().strftime("%Y-%m-%d"); do_daily = cache.get(cache_id + "_daily") != today
             summary, min_harvest, _brewed = run(client, do_daily=do_daily)
             notify_lines.append("👤 %s\n%s" % (mask, summary))
-            if do_daily: cache[wxid + "_daily"] = today; save_cache(cache)
+            completed_count += 1
+            if do_daily and client.daily_completed: cache[cache_id + "_daily"] = today; save_cache(cache)
             if min_harvest is not None: all_min_harvests.append((remark, min_harvest))
         except (Exception, TokenInvalidError) as e:
             msg = str(e)
@@ -1524,17 +1685,18 @@ if __name__ == "__main__":
                              or "4012" in msg or "非法的用户 token" in msg
                              or "token" in msg.lower() and ("失效" in msg or "非法" in msg or "无效" in msg or "过期" in msg)
                              or isinstance(e, TokenInvalidError))
-            if TOKEN_INVALID and cache.get(wxid):
-                cache.pop(wxid, None); save_cache(cache)
+            if TOKEN_INVALID and cache.get(cache_id):
+                cache.pop(cache_id, None); save_cache(cache)
                 log.warning("   ⚠️  检测到 token 失效(%s)，立即清除缓存 token 并重新登录重试..." % msg.split("]")[0].strip("["))
                 try:
                     result = auto_login_with_retry(client, wxid, WX_SERVER, OCR_SERVER, base_delay=5)
                     if result.get("token"):
-                        cache[wxid] = client.token; save_cache(cache)
-                        today = datetime.now().strftime("%Y-%m-%d"); do_daily = cache.get(wxid + "_daily") != today
+                        cache[cache_id] = client.token; save_cache(cache)
+                        today = datetime.now().strftime("%Y-%m-%d"); do_daily = cache.get(cache_id + "_daily") != today
                         summary, min_harvest, _brewed = run(client, do_daily=do_daily)
                         notify_lines.append("👤 %s\n%s" % (mask, summary))
-                        if do_daily: cache[wxid + "_daily"] = today; save_cache(cache)
+                        completed_count += 1
+                        if do_daily and client.daily_completed: cache[cache_id + "_daily"] = today; save_cache(cache)
                         if min_harvest is not None: all_min_harvests.append((remark, min_harvest))
                         log.info("   ✅ 重新登录重试成功")
                     else:
@@ -1542,12 +1704,13 @@ if __name__ == "__main__":
                         notify_lines.append("👤 %s\n❌ 执行异常: %s" % (mask, e))
                 except (Exception, TokenInvalidError) as e2:
                     log.error("   ❌ 重试异常: %s" % e2, exc_info=True)
-                    notify_lines.append("👤 %s\n❌ 执行异常: %s" % (mask, e))
+                    notify_lines.append("👤 %s\n❌ 执行异常: %s" % (mask, e2))
             else:
                 log.error("   ❌ 执行异常: %s" % e, exc_info=True)
                 notify_lines.append("👤 %s\n❌ 执行异常: %s" % (mask, e))
         time.sleep(random.randint(2, 5))
 
+    log.info('本次账号结果：完成 %d / %d；其余账号的原因见上方记录', completed_count, len(accounts))
     if notify_lines:
         content = "作者：\n\n" + "\n\n".join(notify_lines)
         # 全账号本月酿酒合计(一行汇总)
