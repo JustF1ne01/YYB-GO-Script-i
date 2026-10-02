@@ -4,7 +4,7 @@
 # cron: 6 8 * * *
 """
 name: 南方航空签到
-cron: 16 9 * * *
+cron: 6 8 * * *
 
 中国南方航空（明珠会员）微信小程序「天天签到」每日签到 + 连续签到奖励（抽奖机会 / 里程），
 基于 YYB-Go-Enhanced 自动取码登录，全程无需抓包。
@@ -17,6 +17,7 @@ cron: 16 9 * * *
   NFHK_ENABLE_SIGN     可选，默认 1；=0 只查询不签到
   NFHK_ENABLE_AWARD    可选，默认 1；=0 关闭「自动领取待领奖品」
   NFHK_ENABLE_LOTTERY  可选，默认 1；=0 关闭抽奖机会的探测与提示
+  NFHK_ENABLE_RELOGIN  可选，默认 1；=0 关闭 S00011（登录信息失效）自动重新取码登录
   NFHK_LOGIN_RETRY     可选，登录重试次数，默认 3（code 一次性，失败会换新 code 重试）
   NFHK_REQUEST_TIMEOUT 可选，单次请求超时秒数，默认 30
   NFHK_RANDOM_HEADERS  可选，默认 1；=0 关闭随机 User-Agent
@@ -29,6 +30,116 @@ cron: 16 9 * * *
       -> 复查里程与金币 -> 汇总通知。多账号串行，非明珠会员归入「跳过」不计失败。
 
 ────────────────────────────────────────────────────────────────────────────
+登录链路（全部由小程序包 + 签到 H5 静态分析复现，无任何抓包）
+────────────────────────────────────────────────────────────────────────────
+小程序 AppID  wx729238547ac7a14c      接口域  https://wxapi.csair.com
+签到业务在 H5：https://wxapi.csair.com/h5/sign/#/signTools （react SPA，
+小程序「我 → 签到」用 web-view 打开它，登录态通过 URL 的 token 参数传入）
+
+  1. YYB   POST /wxapp/getCode                        -> wx.login code + 微信 openid
+  2. 南航  POST /mini/api/login/login                 -> sessionId / unionId / openId
+           ?appid=wx729238547ac7a14c&wxchannel=wxopen&envVersion=release
+           请求头 sessionId="" / channel=ecsair / activityChannel=1 / unnecessaryParam=""
+           body   {"code": <code>}
+  3. 南航  POST /mini/api/login/isLogin               -> 明珠会员信息（含 token、usefulMileage 里程）
+           请求头 sessionId=<上一步 sessionId>
+           body   {"ssoKey": <unionId>, "clientType": "PC"}
+  4. 拿到的 member.token 就是签到 H5 的登录态：H5 把它写成 Cookie
+           TOKEN=<token> 与 cs1246643sso=<token>（两个都必须带，缺一个会报 S0001 登录凭证为空）
+
+────────────────────────────────────────────────────────────────────────────
+签到 H5 接口（域 https://wxapi.csair.com，统一 query: type=APPTYPE&chanel=ss&lang=zh）
+────────────────────────────────────────────────────────────────────────────
+  POST /marketing-tools/activity/load            {activityType:"sign", channel:"mini"} 活动配置
+        -> data.activityDtoList[].signActivity：activityName「天天签到」、
+           rewardType=serialSign、signTimeRange=08:00:00-23:59:59、
+           pinpointAwardConfig = 精准里程奖励日（指定日期签到额外给里程）
+  GET  /marketing-tools/sign/getSignCalendarNew  ?startQueryDate=YYYYMM01&endQueryDate=YYYYMM末
+        -> data.dateList 该月已签日期（只返回所查月份）、awardDisplay = 连签奖励阶梯
+           阶梯元素：{dateOfAward, rewardType:"serialSign", prizeType:
+                     "lotteryAward"（抽奖机会）|"mileageAward"（直接给里程）,
+                     num, isGain}
+  GET  /marketing-tools/sign/getSignProgress     已废弃，signSerial 恒为 null
+  GET  /marketing-tools/sign/getUserAwardContent 奖励条件进度（如「抽奖机会（连签3天）」）
+  GET  /marketing-tools/sign/getSignUserCoinBalance / POST .../getSignGoldCountNum {pageNo:1} 金币
+        -> 上述账号金币体系未开通，balance 恒为 "--"，实际积分就是里程
+  POST /marketing-tools/award/awardList          {activityType:"sign", awardStatus, pageNum}
+        awardStatus ∈ {all, waitReceive, received, expired}
+        （H5 按钮态另有 benefitWaitReceive / lotteryWaitReceive「待参与」，列表用 waitReceive 即可）
+  POST /marketing-tools/award/getAward           {activityType:"sign", signUserRewardId} 领奖
+  POST /marketing-tools/activity/join            {activityType:"sign", channel:"mini"} 执行签到
+        respCode=0000 且 data.code ∈ {00A1 本次有奖, 00A2 成功, 00A0/00A3 本档无额外奖励}
+        respCode ∈ {S2001 今日已签, 0130/0131/0140/0141/0150/0151} 为提示类，H5 也只弹文案
+        respCode=S0003 需实名认证（2026-10 起，账号资质问题，不算脚本失败）
+        respCode=S00011 登录信息失效 -> 按前端逻辑重新取码登录后重试（NFHK_ENABLE_RELOGIN）
+
+────────────────────────────────────────────────────────────────────────────
+关于「连续签到抽奖」（如实说明能力边界）
+────────────────────────────────────────────────────────────────────────────
+  活动「天天签到」是 serialSign（连续/累计签到）玩法，连签到达指定天数后由服务端
+  在 awardList 里下发一条待领奖品：
+      {"awardType":"lotteryAward", "awardName":"抽奖机会", "signDay":"3",
+       "awardDesc":"{...lotteryUrl...}", "awardId":..., "activityId":..., "id":...}
+
+  抽奖链路（H5 home chunk 的 signAwardJump / received 复现）：
+    1. POST award/getAward {signUserRewardId: id}
+       成功条件：respCode=0000 且 data.code=0000
+    2. 若奖品是抽奖机会，H5 会拼出跳转地址并交给小程序打开：
+         url = <lotteryUrl> &signInGiftId=<awardId>
+                            &signInActivityId=<activityId> &rewardId=<id>
+       lotteryUrl 有两个来源（两处代码各用一个）：奖品对象顶层的 `lotteryUrl`，
+       或 `JSON.parse(awardDesc).lotteryUrl`；跳转字段另有 microJumpPage/microJumpLink。
+       最终动作是 window.wx.miniProgram.navigateTo({url})，即**小程序内的一个页面**，
+       转盘本身在那个页面里（通常还要看激励视频才给转）。
+
+  因此本脚本对抽奖的能力边界是：**自动把「抽奖机会」领到手，并把抽奖入口原样打印出来**
+  （通知里也会带），点一下即可参与。转盘本身在微信内的页面里、且带激励视频门槛，
+  无法在青龙里代跑；脚本不会伪造任何抽奖结果。
+  连签第 3 天（本活动 2026-09-23）首次拿到抽奖机会时，日志里会出现完整入口地址。
+
+────────────────────────────────────────────────────────────────────────────
+实测记录（2026-09-21，青龙容器 ql2）
+────────────────────────────────────────────────────────────────────────────
+  · 5 个账号：1/3/5 是明珠会员且签到成功，2/4 未注册 → 跳过（不算失败）
+  · 定时任务 id=1127（task nfhk.py，6 8 * * *），走任务通道跑通，PushPlus 通知送达
+  · 注意：面板用 command-run 手工跑不会加载任务环境变量，需要在命令里显式带上
+  · 2026-10 起：面板任务改为仓库订阅模式（id=1128，task lcmovie_YYB-GO-Script-i_main/
+    wx-script/nfhk.py），日志目录 wx-script_nfhk/
+
+────────────────────────────────────────────────────────────────────────────
+活动规则（2026-09 期，已与官方规则弹窗逐条核对）
+────────────────────────────────────────────────────────────────────────────
+  官方弹窗原文：「9月签到新玩法上线！每日 8:00—23:59:59 签到。
+    9.1 签到可获得 2 里程；9.15 签到可获得 8 里程；9.28 签到可获得 88 里程；
+    连续签到 3 天，可获得抽奖机会，有机会获得 6000 里程、666 里程、66 里程、
+    5天+30%里程奖励券、2 里程。」
+
+  与接口数据的对应关系（全部由 activity/load 下发，脚本不硬编码任何一条）：
+    · 签到时段 8:00–23:59:59  -> signActivity.signTimeRange = "08:00:00-23:59:59"
+    · 9.1/9.15/9.28 里程      -> signActivity.pinpointAwardConfig
+                                 （3 条 mileageAward，分别为 2 / 8 / 88）
+    · 连签 3 天得抽奖机会      -> getSignCalendarNew.awardDisplay 里
+                                 dateOfAward=2026-09-23, prizeType=lotteryAward
+                                 （同月还有 09-26 / 09-29 两个抽奖档、09-28 里程档）
+  ⚠️ 弹窗里那份**奖池清单（6000/666/66 里程、5天+30%里程券、2 里程）接口并不下发**
+     （activity/load 的 popContent / tagConfig / shareRewardConfig 全为 null，
+      H5 全部 15 个 js chunk 里也搜不到这些数字，属运营侧图文）。
+     所以脚本只认服务端返回的奖品，绝不猜测或写死奖池 —— 中奖结果以服务端为准。
+
+────────────────────────────────────────────────────────────────────────────
+2026-10 跨月复测（10-02，小程序 469→470、H5 chunk 已更新后实测）
+────────────────────────────────────────────────────────────────────────────
+  结论：**接口、签名参数、抽奖拼法全部不变，活动 id 每月滚动（300 → 308）由脚本动态选取**，
+  无破坏性变更；10 月精准里程日（10-01 +8 / 10-15 +5 / 10-28 +28）与连签阶梯
+  （下一档 10-03 抽奖机会）均正常下发。跨月连签合并实测正常（账号显示「本月 2 天 连续 8/12 天」）。
+
+  新发现的两个点（已处理）：
+  1. respCode=S00011「获取用户登录信息失败」：member token 偶发被服务端吊销
+     （H5 的处理是 `"S00011"===respCode && this.getLogin()` 整页重登）。
+     脚本对策：h5 链路收到 S00011 时自动重新取码登录一次并重试当前请求（NFHK_ENABLE_RELOGIN）。
+  2. respCode=S0003「领取奖品需要先完成实名认证哦~」：10 月活动对**领奖**加了实名门槛
+     （H5 同步新增实名认证弹窗与 aid/uid 校验）。这是账号资质问题，脚本无法代做，
+     归类为「需实名认证」提示（不算脚本失败），到 南方航空App/小程序 完成实名后奖品可正常领取。
 
 作者：lcmovie https://github.com/lcmovie
 """
@@ -97,6 +208,10 @@ SIGN_CODE_MAP = {
 }
 # H5 视为「正常提示」而非报错的 respCode（signButton 的 r 映射表）
 SIGN_SOFT_CODES = {"S2001", "0130", "0131", "0140", "0141", "0150", "0151"}
+# H5/服务端返回 S00011 = 登录信息失效，H5 的处理是整页重新登录（this.getLogin()）
+RELOGIN_CODE = "S00011"
+# 领奖/签到返回 S0003 = 需实名认证（2026-10-02 实测），账号资质问题，不算脚本失败
+REALNAME_CODES = {"S0003"}
 
 
 class SkipAccount(Exception):
@@ -125,6 +240,7 @@ DRY_RUN = env_flag("NFHK_DRY_RUN", "0")
 ENABLE_SIGN = env_flag("NFHK_ENABLE_SIGN", "1")
 ENABLE_AWARD = env_flag("NFHK_ENABLE_AWARD", "1")
 ENABLE_LOTTERY = env_flag("NFHK_ENABLE_LOTTERY", "1")
+ENABLE_RELOGIN = env_flag("NFHK_ENABLE_RELOGIN", "1")
 LOGIN_RETRY = max(1, env_int("NFHK_LOGIN_RETRY", 3))
 TIMEOUT = env_int("NFHK_REQUEST_TIMEOUT", 30)
 RANDOM_HEADERS = env_flag("NFHK_RANDOM_HEADERS", "1")
@@ -252,6 +368,8 @@ class Client:
         self.union_id = ""
         self.session_id = ""
         self.open_id = ""
+        self.host = ""          # YYB 地址（relogin 用）
+        self.ref = ""           # YYB 账号标识（relogin 用）
 
     # ---------------- 小程序链路 ---------------- #
     def mp_post(self, path: str, body: Dict[str, Any], session_id: Optional[str] = None) -> Dict[str, Any]:
@@ -279,6 +397,28 @@ class Client:
         return r.json()
 
     # ---------------- 签到 H5 链路 ---------------- #
+    def relogin(self) -> None:
+        """S00011（登录信息失效）时按 H5 前端逻辑重新取码登录，原地更新会话。
+
+        H5 源码：`"S00011"===t.respCode && this.getLogin()` —— 即整页重走登录链路。
+        2026-10-02 实测：member token 偶发被服务端吊销，重新取码登录即可恢复。
+        """
+        if not self.host or not self.ref:
+            raise ApiError(f"{RELOGIN_CODE} 需要重登，但 Client 未记录 YYB host/ref")
+        code, openid = yyb_get_code(self.host, self.ref)
+        self.open_id = openid
+        data = self.mp_post("/mini/api/login/login", {"code": code})
+        self.session_id = clean(data.get("sessionId"))
+        self.union_id = clean(data.get("unionId"))
+        if not self.session_id or not self.union_id:
+            raise ApiError(f"重登 login/login 未返回 sessionId/unionId: {preview(data)}")
+        member = self.mp_post("/mini/api/login/isLogin",
+                              {"ssoKey": self.union_id, "clientType": CLIENT_TYPE})
+        self.member = member or {}
+        if not clean(self.member.get("token")):
+            raise ApiError("重登后仍未取到会员 token（会员资格可能已变化）")
+        log("   🔁 已重新取码登录，会话已恢复")
+
     def _h5_headers(self) -> Dict[str, str]:
         token = clean(self.member.get("token"))
         headers = headers_json()
@@ -289,7 +429,8 @@ class Client:
         return headers
 
     def h5(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
-           params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           params: Optional[Dict[str, Any]] = None,
+           _relogin_done: bool = False) -> Dict[str, Any]:
         query = dict(H5_QUERY)
         if params:
             for k, v in params.items():
@@ -306,9 +447,16 @@ class Client:
         if r.status_code not in (200, 400):
             raise ApiError(f"HTTP {r.status_code} @ {path}")
         try:
-            return r.json()
+            data = r.json()
         except Exception:
             raise ApiError(f"非 JSON 响应 @ {path}: {clean(r.text)}")
+        # S00011 = 登录信息失效：与 H5 一致，重新取码登录后重试一次（防循环）
+        if (ENABLE_RELOGIN and not _relogin_done
+                and clean(data.get("respCode")).upper() == RELOGIN_CODE):
+            log(f"   🔁 {path} 返回 {RELOGIN_CODE}（登录信息失效），自动重新登录后重试")
+            self.relogin()
+            return self.h5(method, path, body, params, _relogin_done=True)
+        return data
 
 
 def yyb_get_code(host: str, ref: str) -> Tuple[str, str]:
@@ -335,6 +483,7 @@ def yyb_get_code(host: str, ref: str) -> Tuple[str, str]:
 def login_once(host: str, ref: str) -> Client:
     """完整登录：YYB 取码 → /mini/api/login/login → /mini/api/login/isLogin。"""
     client = Client()
+    client.host, client.ref = host, ref          # 记录来源，S00011 重登时要用
     code, openid = yyb_get_code(host, ref)
     client.open_id = openid
     dbg("code =", code[:24], "...")
@@ -551,6 +700,12 @@ def do_sign(client: Client) -> Dict[str, Any]:
         return {"status": "already", "code": resp_code,
                 "message": clean(data.get("respMsg")) or f"未执行签到（respCode={resp_code}）",
                 "data": data.get("data")}
+    if resp_code in REALNAME_CODES:
+        # S0003 需实名认证（2026-10 起）：账号资质问题，不算脚本失败
+        return {"status": "need_verify", "code": resp_code,
+                "message": (f"需实名认证：{clean(data.get('respMsg')) or '请先完成实名认证'}"
+                            "（到「南方航空App/小程序-我的」完成实名后再试）"),
+                "data": data.get("data")}
     return {"status": "fail", "code": resp_code,
             "message": f"{clean(data.get('respMsg')) or '签到失败'}（respCode={resp_code}）",
             "data": data.get("data")}
@@ -583,9 +738,17 @@ def claim_awards(client: Client) -> List[Dict[str, Any]]:
         # H5 的成功判定是 respCode=0000 且 data.code=0000（signAwardJump）
         inner = data.get("data") or {}
         inner_code = clean(inner.get("code")).upper()
-        if clean(data.get("respCode")) != "0000" or inner_code not in ("", "0000"):
+        top_code = clean(data.get("respCode")).upper()
+        if top_code in REALNAME_CODES:
+            # S0003 需实名认证（2026-10 起）：无法代做，明确提示归为「待实名」
+            item["need_verify"] = True
+            item["message"] = (f"{name} 需实名认证：{clean(data.get('respMsg')) or '请先完成实名认证'}"
+                               "（到「南方航空App/小程序-我的」完成实名后可正常领取）")
+            results.append(item)
+            continue
+        if top_code != "0000" or inner_code not in ("", "0000"):
             item["message"] = (f"{name} 领取失败：{clean(data.get('respMsg')) or '未知原因'}"
-                               f"（respCode={clean(data.get('respCode'))}"
+                               f"（respCode={top_code}"
                                f"{'/code=' + inner_code if inner_code else ''}）")
             results.append(item)
             continue
