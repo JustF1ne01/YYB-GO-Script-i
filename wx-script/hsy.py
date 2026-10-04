@@ -221,8 +221,8 @@ def withdraw_all(session, username):
     cashable = amount(info.get("award_amount"))
     minimum = amount(info.get("award_cash"))
     maximum = amount(info.get("award_cash_most"))
-    if cashable <= Decimal("1"):
-        return f"可提现 {cashable:.2f} 元，未超过 1.00 元，跳过"
+    if cashable < Decimal("1"):
+        return f"可提现 {cashable:.2f} 元，未达到 1.00 元，跳过"
     if minimum and cashable < minimum:
         return f"可提现 {cashable:.2f} 元，低于平台门槛 {minimum:.2f} 元，跳过"
     if maximum and cashable > maximum:
@@ -275,7 +275,7 @@ def run_one(index, server, ref, context):
 
 def main():
     context = bind_context()
-    output = ["回收猿：超过 1.00 元时尝试一次全额提现"]
+    output = ["回收猿：可提现金额达到 1.00 元时尝试一次全额提现"]
     for index, (server, ref) in enumerate(routes(), 1):
         output.extend(run_one(index, server, ref, context))
     notify(output)
