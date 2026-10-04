@@ -208,35 +208,19 @@ def join_zero_event(session, username):
     return results or ["0 元夺宝：未发现可处理活动"]
 
 
-def withdraw_all(session, username):
-    # v135 奖励金分包：envcash.php?action=add&type=award&app=wx。
-    # 服务端成功仅创建商家转账包；青龙无法替代微信客户端 requestMerchantTransfer 的收款确认。
+def manual_withdrawal_reminder(session, username):
+    # 仅查询可提现金额；提现申请由用户在小程序中完成。
     available = api(session, "envcash.php", {
         "action": "awardlist", "appkey": APP_KEY, "genre": "0", "merchant_id": MERCHANT_ID,
         "type": "award", "username": username,
     })
     if not success(available):
-        return f"提现资格查询失败：{message(available)}"
+        return f"可提现金额查询失败：{message(available)}"
     info = available.get("data") or {}
     cashable = amount(info.get("award_amount"))
-    minimum = amount(info.get("award_cash"))
-    maximum = amount(info.get("award_cash_most"))
-    if cashable <= Decimal("1"):
-        return f"可提现 {cashable:.2f} 元，未超过 1.00 元，跳过"
-    if minimum and cashable < minimum:
-        return f"可提现 {cashable:.2f} 元，低于平台门槛 {minimum:.2f} 元，跳过"
-    if maximum and cashable > maximum:
-        return f"可提现 {cashable:.2f} 元，高于单笔上限 {maximum:.2f} 元，跳过（不拆单）"
-    body = api(session, "envcash.php", {
-        "action": "add", "amount": f"{cashable:.2f}", "app": "wx", "appkey": APP_KEY,
-        "merchant_id": MERCHANT_ID, "type": "award", "version": "2", "username": username,
-    })
-    if not success(body):
-        return f"全额提现 {cashable:.2f} 元失败：{message(body)}"
-    transfer = body.get("data") or {}
-    if transfer.get("package_info"):
-        return f"已发起全额提现 {cashable:.2f} 元；等待微信客户端确认收款"
-    return f"全额提现 {cashable:.2f} 元已提交：{message(body)}"
+    if cashable >= Decimal("1"):
+        return f"可提现 {cashable:.2f} 元，请进入回收猿小程序手动申请提现"
+    return None
 
 
 def notify(lines):
@@ -247,7 +231,7 @@ def notify(lines):
             sys.path.insert(0, path)
     try:
         from notify import send
-        send("回收猿签到提现", "\n".join(lines))
+        send("回收猿签到与活动", "\n".join(lines))
     except Exception as exc:
         print(f"[通知] 发送失败（不影响任务）：{exc}")
 
@@ -266,7 +250,9 @@ def run_one(index, server, ref, context):
         time.sleep(1)
         final, _ = center(session, username)
         result.append(f"最终奖励金：{final:.2f} 元")
-        result.append(withdraw_all(session, username))
+        reminder = manual_withdrawal_reminder(session, username)
+        if reminder:
+            result.append(reminder)
     except Exception as exc:
         result.append(f"失败：{exc}")
     print(" | ".join(result))
@@ -275,7 +261,7 @@ def run_one(index, server, ref, context):
 
 def main():
     context = bind_context()
-    output = ["回收猿：超过 1.00 元时尝试一次全额提现"]
+    output = ["回收猿：签到、抽奖与 0 元夺宝"]
     for index, (server, ref) in enumerate(routes(), 1):
         output.extend(run_one(index, server, ref, context))
     notify(output)
