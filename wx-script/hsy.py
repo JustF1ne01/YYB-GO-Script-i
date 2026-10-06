@@ -223,6 +223,45 @@ def manual_withdrawal_reminder(session, username):
     return None
 
 
+def money_summary(initial, final):
+    before = f"{initial:.2f} 元" if initial is not None else "未取得"
+    after = f"{final:.2f} 元" if final is not None else "未取得"
+    if initial is None or final is None:
+        return f"奖励金：初始 {before} → 最终 {after}"
+    change = final - initial
+    difference = f"+{change:.2f} 元" if change > 0 else (f"{change:.2f} 元" if change < 0 else "无变化")
+    return f"奖励金：初始 {before} → 最终 {after}（{difference}）"
+
+
+def task_status(value, prefix):
+    detail = value.removeprefix(prefix).lstrip("：").strip()
+    if "失败" in detail or "缺少" in detail:
+        return f"❌ {detail}"
+    if "成功" in detail or "已签到" in detail or "已参加" in detail:
+        return f"✅ {detail}"
+    if "无可用" in detail or "当前无" in detail or "未发现" in detail:
+        return f"— {detail}"
+    return f"🎁 {detail}"
+
+
+def format_account(index, initial, final, sign_result, draw_result, events, reminder, error, compact=False):
+    label = f"账号 {index:02d}"
+    lines = [label, money_summary(initial, final)]
+    if sign_result:
+        lines.append(f"签到：{task_status(sign_result, '签到')}")
+    if draw_result:
+        lines.append(f"幸运抽奖：{task_status(draw_result, '幸运抽奖')}")
+    for event in events:
+        lines.append(f"0 元夺宝：{task_status(event, '0 元夺宝')}")
+    if reminder:
+        lines.append(f"提现：{'❌' if '失败' in reminder else '🔔'} {reminder}")
+    if error:
+        lines.append(f"运行异常：❌ {error}")
+    if compact:
+        return "\n".join(lines)
+    return "\n".join([f"╭─ {lines[0]} ─────────────────────", *(f"│ {line}" for line in lines[1:]), "╰──────────────────────────────"])
+
+
 def notify(lines):
     if os.getenv("HSY_NOTIFY", "1").lower() in {"0", "false", "no"}:
         return
@@ -231,39 +270,46 @@ def notify(lines):
             sys.path.insert(0, path)
     try:
         from notify import send
-        send("回收猿签到与活动", "\n".join(lines))
+        send("回收猿｜每日任务", "\n".join(lines))
+        print("📨 通知已交给青龙通知模块")
     except Exception as exc:
         print(f"[通知] 发送失败（不影响任务）：{exc}")
 
 
 def run_one(index, server, ref, context):
-    result = [f"账号 {index}（YYB {ref}）"]
+    initial = final = None
+    sign_result = draw_result = reminder = error = None
+    events = []
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 MicroMessenger/7.0.20.1781 MiniProgramEnv/Windows"})
     try:
         username = login(session, server, ref, context)
         initial, _ = center(session, username)
-        result.append(f"初始奖励金：{initial:.2f} 元")
-        result.append(sign_in(session, username))
-        result.append(lucky_draw(session, username))
-        result.extend(join_zero_event(session, username))
+        sign_result = sign_in(session, username)
+        draw_result = lucky_draw(session, username)
+        events = join_zero_event(session, username)
         time.sleep(1)
         final, _ = center(session, username)
-        result.append(f"最终奖励金：{final:.2f} 元")
         reminder = manual_withdrawal_reminder(session, username)
-        if reminder:
-            result.append(reminder)
     except Exception as exc:
-        result.append(f"失败：{exc}")
-    print(" | ".join(result))
-    return result
+        error = str(exc)
+    print(format_account(index, initial, final, sign_result, draw_result, events, reminder, error))
+    return format_account(index, initial, final, sign_result, draw_result, events, reminder, error, compact=True), bool(error)
 
 
 def main():
     context = bind_context()
-    output = ["回收猿：签到、抽奖与 0 元夺宝"]
-    for index, (server, ref) in enumerate(routes(), 1):
-        output.extend(run_one(index, server, ref, context))
+    accounts = routes()
+    output = [f"共处理 {len(accounts)} 个账号", ""]
+    failures = 0
+    print(f"回收猿 · 每日任务｜共 {len(accounts)} 个账号")
+    for index, (server, ref) in enumerate(accounts, 1):
+        notice, failed = run_one(index, server, ref, context)
+        output.extend([notice, ""])
+        failures += failed
+    summary = f"处理完成：{len(accounts)} 个账号，运行异常 {failures} 个"
+    print(summary)
+    output.append(summary)
     notify(output)
 
 
